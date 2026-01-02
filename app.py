@@ -891,4 +891,4 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
 if __name__ == "__main__":
     print(f"Starting Gradio App. Attempting to use device: {DEVICE}")
-    demo.launch(share=True)
+    demo.launch(server_name="0.0.0.0")
