@@ -22,18 +22,27 @@ import os
 from transformers import AutoTokenizer, AutoModel
 # from model.modeling_llada import LLaDAModelLM
 
-def add_gumbel_noise(logits, temperature):
-    '''
+def add_gumbel_noise(logits, temperature, dtype=None):
+    """
     The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-    Thus, we use float64.
-    '''
+    """
     if temperature == 0:
         return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
+    if dtype is None:
+        dtype = torch.bfloat16
+    logits = logits.to(dtype)
+    noise = torch.rand_like(logits, dtype=dtype)
+    gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
+
+
+def selected_probs_from_logits(logits, selected_ids, dtype=None):
+    if dtype is None:
+        dtype = torch.bfloat16
+    logits_for_conf = logits.to(dtype)
+    logsumexp = torch.logsumexp(logits_for_conf, dim=-1)
+    selected_logits = torch.gather(logits_for_conf, dim=-1, index=selected_ids.unsqueeze(-1)).squeeze(-1)
+    return torch.exp(selected_logits - logsumexp)
 
 
 def get_num_transfer_tokens(mask_index, steps):
@@ -255,9 +264,7 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+        x0_p = selected_probs_from_logits(logits, x0)
     elif remasking == 'random':
         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
     else:
@@ -282,9 +289,7 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+        x0_p = selected_probs_from_logits(logits, x0)
     elif remasking == 'random':
         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
     else:

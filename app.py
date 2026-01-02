@@ -2,6 +2,8 @@ import gradio as gr
 import torch
 import numpy as np
 import torch.nn.functional as F
+import gc
+import os
 from transformers import AutoTokenizer
 from torchvision import transforms
 from models import MAGVITv2, get_mask_schedule, MMadaModelLM
@@ -16,27 +18,31 @@ def image_transform(image, resolution=256, normalize=True):
         image = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)(image)
     return image
 
-def add_gumbel_noise(logits, temperature):
+def add_gumbel_noise(logits, temperature, dtype=None):
     """
     Adds Gumbel noise to logits for stochastic sampling.
     Equivalent to argmax(logits + temperature * G) where G ~ Gumbel(0,1).
-    This version is more numerically stable than a version involving exp() and division.
     """
-    if abs(temperature) < 1e-9: # Effectively zero temperature
+    if abs(temperature) < 1e-9:
         return logits
-    # Ensure logits are float64 for precision with noise, as suggested by user context
-    if DEVICE == "mps":
-        logits = logits.to(torch.float32)
-    else:
-        logits = logits.to(torch.float64)
-    # Standard Gumbel noise: -log(-log(U)), U ~ Uniform(0,1)
-    # Add small epsilon for numerical stability inside logs
-    if DEVICE == "mps":
-        noise = torch.rand_like(logits, dtype=torch.float32)
-    else:
-        noise = torch.rand_like(logits, dtype=torch.float64)
+    if dtype is None:
+        if DEVICE == "mps":
+            dtype = torch.float32
+        else:
+            dtype = torch.bfloat16
+    logits = logits.to(dtype)
+    noise = torch.rand_like(logits, dtype=dtype)
     standard_gumbel_noise = -torch.log(-torch.log(noise + 1e-20) + 1e-20)
     return logits + temperature * standard_gumbel_noise
+
+
+def selected_probs_from_logits(logits, selected_ids, dtype=None):
+    if dtype is None:
+        dtype = torch.float32 if DEVICE == "mps" else torch.bfloat16
+    logits_for_conf = logits.to(dtype)
+    logsumexp = torch.logsumexp(logits_for_conf, dim=-1)
+    selected_logits = torch.gather(logits_for_conf, dim=-1, index=selected_ids.unsqueeze(-1)).squeeze(-1)
+    return torch.exp(selected_logits - logsumexp)
 
 def get_num_transfer_tokens(mask_index, steps):
     mask_num = mask_index.sum(dim=1, keepdim=True)
@@ -49,6 +55,66 @@ def get_num_transfer_tokens(mask_index, steps):
         if remainder[i] > 0 : # Ensure remainder is positive before indexing
              num_transfer_tokens[i, :remainder[i].item()] += 1 # .item() for single value tensor to int
     return num_transfer_tokens
+
+def maybe_free_memory(enabled):
+    if not enabled:
+        return
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+def get_rss_bytes():
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+def check_abort_memory(limit_gb):
+    if not limit_gb:
+        return None
+    rss = get_rss_bytes()
+    if rss is None:
+        return None
+    limit_bytes = int(limit_gb * (1024 ** 3))
+    if rss > limit_bytes:
+        rss_gb = rss / (1024 ** 3)
+        return f"Aborted: RAM usage {rss_gb:.1f} GB exceeded limit {limit_gb} GB."
+    return None
+
+def _snap_block_length(gen_length, block_length, min_val, max_val):
+    if gen_length <= 0:
+        return max(min_val, min(max_val, block_length))
+    upper = min(max_val, gen_length)
+    candidates = [d for d in range(min_val, upper + 1) if gen_length % d == 0]
+    if not candidates:
+        return max(min_val, min(max_val, gen_length))
+    return min(candidates, key=lambda d: (abs(d - block_length), -d))
+
+def _snap_steps(steps, num_blocks, min_val, max_val):
+    if num_blocks <= 0:
+        return max(min_val, min(max_val, steps))
+    min_mult = max(1, (min_val + num_blocks - 1) // num_blocks)
+    max_mult = max_val // num_blocks
+    if min_mult > max_mult:
+        return num_blocks
+    target_mult = int(round(steps / num_blocks))
+    target_mult = max(min_mult, min(max_mult, target_mult))
+    return target_mult * num_blocks
+
+def normalize_generation_params(gen_length, block_length, steps, min_block, max_block, min_steps, max_steps):
+    gen_length = int(gen_length)
+    block_length = _snap_block_length(gen_length, int(block_length), min_block, max_block)
+    num_blocks = max(1, gen_length // block_length)
+    steps = _snap_steps(int(steps), num_blocks, min_steps, max_steps)
+    return block_length, steps
 
 MODEL = None
 TOKENIZER = None
@@ -166,7 +232,7 @@ def get_highlighted_text_tuples(current_x_ids_batch, prompt_input_ids, prompt_le
     return intermediate_tuples
 
 @torch.no_grad()
-def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, mask_schedule="cosine"):
+def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abort_on_ram, mask_schedule="cosine"):
     global MODEL, TOKENIZER, MASK_ID, DEVICE, uni_prompting
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -187,27 +253,37 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, mask_schedule="
     mask_schedule = get_mask_schedule(mask_schedule)
     blank_image = Image.new("RGB", (512, 512), (255, 255, 255))
     yield blank_image, "Starting generation..."
-    for image_step, status_msg_step in MODEL.t2i_generate_decoding_stepwise(
-            input_ids = input_ids,
-            uncond_input_ids = uncond_input_ids,    
-            attention_mask = attention_mask,
-            uncond_attention_mask = uncond_attention_mask,
-            temperature=1.0,
-            timesteps = steps,
-            guidance_scale = guidance_scale,
-            noise_schedule = mask_schedule,
-            noise_type = "mask",
-            seq_len = 1024,
-            vq_model = VQ_MODEL,
-            uni_prompting=uni_prompting):
-        yield image_step, status_msg_step  
+    last_image = blank_image
+    ram_limit_gb = 96 if abort_on_ram else 0
+    try:
+        for image_step, status_msg_step in MODEL.t2i_generate_decoding_stepwise(
+                input_ids = input_ids,
+                uncond_input_ids = uncond_input_ids,    
+                attention_mask = attention_mask,
+                uncond_attention_mask = uncond_attention_mask,
+                temperature=1.0,
+                timesteps = steps,
+                guidance_scale = guidance_scale,
+                noise_schedule = mask_schedule,
+                noise_type = "mask",
+                seq_len = 1024,
+                vq_model = VQ_MODEL,
+                uni_prompting=uni_prompting):
+            last_image = image_step
+            abort_msg = check_abort_memory(ram_limit_gb)
+            if abort_msg:
+                yield last_image, abort_msg
+                return
+            yield image_step, status_msg_step
+    finally:
+        maybe_free_memory(free_cache)
     
         
         
 
 @torch.no_grad()
 def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_lm): 
+                         cfg_scale, remasking_strategy, thinking_mode_lm, free_cache, abort_on_ram): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
     print(f"thinking_mode_lm: {thinking_mode_lm}")
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -217,6 +293,9 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
     steps = int(steps)
     gen_length = int(gen_length)
     block_length = int(block_length)
+    block_length, steps = normalize_generation_params(
+        gen_length, block_length, steps, 8, 1024, 1, 512
+    )
 
     if thinking_mode_lm:
         prompt_text = "You should first think about the reasoning process in the mind and then provide the user with the answer. The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here\n" + prompt_text
@@ -235,8 +314,18 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
                  yield [("Tokenizer Error", "ERROR")], "pad_token_id is not set in tokenizer."
                  return
 
-        input_ids = TOKENIZER(text=processed_prompt_text, return_tensors="pt", padding="longest", padding_side="left", truncation=True, max_length=MODEL.config.max_position_embeddings if hasattr(MODEL.config, 'max_position_embeddings') else 2048)['input_ids'].to(DEVICE)
-        raw_prompt_attention_mask = None
+        tokenized = TOKENIZER(
+            text=processed_prompt_text,
+            return_tensors="pt",
+            padding="longest",
+            padding_side="left",
+            truncation=True,
+            max_length=MODEL.config.max_position_embeddings if hasattr(MODEL.config, 'max_position_embeddings') else 2048,
+        )
+        input_ids = tokenized["input_ids"].to(DEVICE)
+        raw_prompt_attention_mask = tokenized.get("attention_mask", None)
+        if raw_prompt_attention_mask is not None:
+            raw_prompt_attention_mask = raw_prompt_attention_mask.to(DEVICE)
         
     except Exception as e:
         yield [("Error tokenizing prompt.", "ERROR")], f"Tokenization error: {e}"
@@ -257,116 +346,119 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
          yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_output[0] if final_text_output else ""
          return
 
-    if block_length <= 0 or gen_length % block_length != 0 :
+    if block_length <= 0 or gen_length % block_length != 0:
         yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), \
               f"Error: gen_length ({gen_length}) must be divisible by block_length ({block_length}) and block_length > 0."
         return
     num_blocks = gen_length // block_length
-
-    if steps <=0 or steps % num_blocks != 0:
+    if steps <= 0 or steps % num_blocks != 0:
         yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), \
               f"Error: steps ({steps}) must be positive and divisible by num_blocks ({num_blocks}). Steps: {steps}, Num Blocks: {num_blocks}"
         return
     steps_per_block = steps // num_blocks
+    ram_limit_gb = 96 if abort_on_ram else 0
     
-    for num_block_iter in range(num_blocks):
-        current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
-        current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
-        
-        block_masks_bool_current = torch.zeros_like(x, dtype=torch.bool) 
-        block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x] = \
-            (x[:, current_block_start_idx_in_x:current_block_end_idx_in_x] == MASK_ID)
+    try:
+        for num_block_iter in range(num_blocks):
+            current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
+            current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
+            
+            block_masks_bool_current = torch.zeros_like(x, dtype=torch.bool) 
+            block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x] = \
+                (x[:, current_block_start_idx_in_x:current_block_end_idx_in_x] == MASK_ID)
 
-        num_transfer_tokens_for_this_block = get_num_transfer_tokens(
-            block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x],
-            steps_per_block
-        )
-
-        for i_step_in_block in range(steps_per_block):
-            mask_index_global = (x == MASK_ID) 
-                        
-            if cfg_scale > 0.:
-                un_x = x.clone()
-                # For unconditional pass, mask out the original prompt tokens that are not padding
-                # raw_prompt_attention_mask is (B, prompt_len)
-                prompt_active_tokens_mask = raw_prompt_attention_mask.bool() # True where actual prompt tokens are
-                un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
-                
-                x_cfg_input = torch.cat([x, un_x], dim=0)
-                # Pass attention_mask for CFG if model expects it, covering both parts
-                # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
-                model_output = MODEL(x_cfg_input) 
-                logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
-                logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
-            else:
-                # Not passing explicit attention_mask here; relies on model's internal handling.
-                model_output = MODEL(x) 
-                logits = model_output.logits
-
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
-
-            if remasking_strategy == 'low_confidence':
-                if DEVICE == "mps":
-                    probs = F.softmax(logits.to(torch.float32), dim=-1)
-                else:
-                    probs = F.softmax(logits.to(torch.float64), dim=-1)
-                x0_probs = torch.gather(probs, dim=-1, index=x0_predicted_tokens.unsqueeze(-1)).squeeze(-1) 
-            elif remasking_strategy == 'random':
-                if DEVICE == "mps":
-                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float32)
-                else:
-                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float64)
-            else: 
-                yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), f"Error: Unknown remasking strategy '{remasking_strategy}'"
-                return
-
-            confidence_for_selection = torch.full_like(x0_probs, -torch.inf) 
-            candidate_positions_for_unmasking = mask_index_global & block_masks_bool_current
-            confidence_for_selection = torch.where(
-                candidate_positions_for_unmasking,
-                x0_probs,
-                -torch.inf
+            num_transfer_tokens_for_this_block = get_num_transfer_tokens(
+                block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x],
+                steps_per_block
             )
-            
-            x0_final_candidates = torch.where(mask_index_global, x0_predicted_tokens, x)
 
-            transfer_indices_bool = torch.zeros_like(x, dtype=torch.bool) 
-            num_to_transfer_this_step_batch = num_transfer_tokens_for_this_block[:, i_step_in_block] 
+            for i_step_in_block in range(steps_per_block):
+                abort_msg = check_abort_memory(ram_limit_gb)
+                if abort_msg:
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
+                    return
+                mask_index_global = (x == MASK_ID) 
+                        
+                if cfg_scale > 0.:
+                    un_x = x.clone()
+                    # For unconditional pass, mask out the original prompt tokens that are not padding
+                    # raw_prompt_attention_mask is (B, prompt_len)
+                    if raw_prompt_attention_mask is None:
+                        prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                    else:
+                        prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
+                    un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
+                        
+                    x_cfg_input = torch.cat([x, un_x], dim=0)
+                    # Pass attention_mask for CFG if model expects it, covering both parts
+                    # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
+                    model_output = MODEL(x_cfg_input) 
+                    logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
+                    logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
+                else:
+                    # Not passing explicit attention_mask here; relies on model's internal handling.
+                    model_output = MODEL(x) 
+                    logits = model_output.logits
 
-            for j_batch_idx in range(batch_size):
-                k_val = min(num_to_transfer_this_step_batch[j_batch_idx].item(), 
-                            candidate_positions_for_unmasking[j_batch_idx].sum().item()) # ensure k isn't too large
+                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
 
-                if k_val > 0:
-                    # Ensure confidence_for_selection[j_batch_idx] is 1D for topk
-                    conf_slice = confidence_for_selection[j_batch_idx]
-                    if conf_slice.ndim > 1: conf_slice = conf_slice.view(-1) # Should already be 1D from x0_probs
-                    
-                    # Check if there are enough valid (non -inf) confidences
-                    valid_conf_count = (conf_slice > -torch.inf).sum().item()
-                    actual_k = min(k_val, valid_conf_count)
+                if remasking_strategy == 'low_confidence':
+                    x0_probs = selected_probs_from_logits(logits, x0_predicted_tokens)
+                elif remasking_strategy == 'random':
+                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float32)
+                else: 
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), f"Error: Unknown remasking strategy '{remasking_strategy}'"
+                    return
 
-                    if actual_k > 0:
-                        _, topk_indices_in_x = torch.topk(conf_slice, k=actual_k)
-                        transfer_indices_bool[j_batch_idx, topk_indices_in_x] = True
-            
-            x[transfer_indices_bool] = x0_final_candidates[transfer_indices_bool]
+                confidence_for_selection = torch.full_like(x0_probs, -torch.inf) 
+                candidate_positions_for_unmasking = mask_index_global & block_masks_bool_current
+                confidence_for_selection = torch.where(
+                    candidate_positions_for_unmasking,
+                    x0_probs,
+                    -torch.inf
+                )
+                
+                x0_final_candidates = torch.where(mask_index_global, x0_predicted_tokens, x)
 
-            current_total_step = num_block_iter * steps_per_block + i_step_in_block + 1
-            total_overall_steps = num_blocks * steps_per_block
-            status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
-            yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+                transfer_indices_bool = torch.zeros_like(x, dtype=torch.bool) 
+                num_to_transfer_this_step_batch = num_transfer_tokens_for_this_block[:, i_step_in_block] 
 
-    final_generated_ids = x[:, prompt_len:]
-    final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
-    
-    final_text_str = final_text_output[0] if final_text_output and len(final_text_output) > 0 else ""
-    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_str
+                for j_batch_idx in range(batch_size):
+                    k_val = min(num_to_transfer_this_step_batch[j_batch_idx].item(), 
+                                candidate_positions_for_unmasking[j_batch_idx].sum().item()) # ensure k isn't too large
+
+                    if k_val > 0:
+                        # Ensure confidence_for_selection[j_batch_idx] is 1D for topk
+                        conf_slice = confidence_for_selection[j_batch_idx]
+                        if conf_slice.ndim > 1: conf_slice = conf_slice.view(-1) # Should already be 1D from x0_probs
+                        
+                        # Check if there are enough valid (non -inf) confidences
+                        valid_conf_count = (conf_slice > -torch.inf).sum().item()
+                        actual_k = min(k_val, valid_conf_count)
+
+                        if actual_k > 0:
+                            _, topk_indices_in_x = torch.topk(conf_slice, k=actual_k)
+                            transfer_indices_bool[j_batch_idx, topk_indices_in_x] = True
+                
+                x[transfer_indices_bool] = x0_final_candidates[transfer_indices_bool]
+
+                current_total_step = num_block_iter * steps_per_block + i_step_in_block + 1
+                total_overall_steps = num_blocks * steps_per_block
+                status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
+                yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+
+        final_generated_ids = x[:, prompt_len:]
+        final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
+        
+        final_text_str = final_text_output[0] if final_text_output and len(final_text_output) > 0 else ""
+        yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_str
+    finally:
+        maybe_free_memory(free_cache)
 
 @torch.no_grad()
 def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_mmu): 
+                         cfg_scale, remasking_strategy, thinking_mode_mmu, free_cache, abort_on_ram): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -376,6 +468,9 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
     steps = int(steps)
     gen_length = int(gen_length)
     block_length = int(block_length)
+    block_length, steps = normalize_generation_params(
+        gen_length, block_length, steps, 32, 1024, 1, 512
+    )
 
     if thinking_mode_mmu:
         prompt_text = "You should first think about the reasoning process in the mind and then provide the user with the answer. The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here\n" + prompt_text
@@ -407,8 +502,18 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
                  yield [("Tokenizer Error", "ERROR")], "pad_token_id is not set in tokenizer."
                  return
 
-        input_ids = TOKENIZER(text=processed_prompt_text, return_tensors="pt", padding="longest", padding_side="left", truncation=True, max_length=MODEL.config.max_position_embeddings if hasattr(MODEL.config, 'max_position_embeddings') else 2048)['input_ids'].to(DEVICE)
-        raw_prompt_attention_mask = None
+        tokenized = TOKENIZER(
+            text=processed_prompt_text,
+            return_tensors="pt",
+            padding="longest",
+            padding_side="left",
+            truncation=True,
+            max_length=MODEL.config.max_position_embeddings if hasattr(MODEL.config, 'max_position_embeddings') else 2048,
+        )
+        input_ids = tokenized["input_ids"].to(DEVICE)
+        raw_prompt_attention_mask = tokenized.get("attention_mask", None)
+        if raw_prompt_attention_mask is not None:
+            raw_prompt_attention_mask = raw_prompt_attention_mask.to(DEVICE)
         if image_vq_ids_tensor is not None:
             if image_vq_ids_tensor.ndim == 1:
                 image_vq_ids_tensor = image_vq_ids_tensor.unsqueeze(0)
@@ -444,112 +549,115 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
          yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_output[0] if final_text_output else ""
          return
 
-    if block_length <= 0 or gen_length % block_length != 0 :
+    if block_length <= 0 or gen_length % block_length != 0:
         yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), \
               f"Error: gen_length ({gen_length}) must be divisible by block_length ({block_length}) and block_length > 0."
         return
     num_blocks = gen_length // block_length
-
-    if steps <=0 or steps % num_blocks != 0:
+    if steps <= 0 or steps % num_blocks != 0:
         yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), \
               f"Error: steps ({steps}) must be positive and divisible by num_blocks ({num_blocks}). Steps: {steps}, Num Blocks: {num_blocks}"
         return
     steps_per_block = steps // num_blocks
+    ram_limit_gb = 96 if abort_on_ram else 0
     
-    for num_block_iter in range(num_blocks):
-        current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
-        current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
-        
-        block_masks_bool_current = torch.zeros_like(x, dtype=torch.bool) 
-        block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x] = \
-            (x[:, current_block_start_idx_in_x:current_block_end_idx_in_x] == MASK_ID)
-
-        num_transfer_tokens_for_this_block = get_num_transfer_tokens(
-            block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x],
-            steps_per_block
-        )
-
-        for i_step_in_block in range(steps_per_block):
-            mask_index_global = (x == MASK_ID) 
+    try:
+        for num_block_iter in range(num_blocks):
+            current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
+            current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
             
-            if cfg_scale > 0.:
-                un_x = x.clone()
-                # For unconditional pass, mask out the original prompt tokens that are not padding
-                # raw_prompt_attention_mask is (B, prompt_len)
-                prompt_active_tokens_mask = raw_prompt_attention_mask.bool() # True where actual prompt tokens are
-                un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
-                
-                x_cfg_input = torch.cat([x, un_x], dim=0)
-                # Pass attention_mask for CFG if model expects it, covering both parts
-                # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
-                model_output = MODEL(x_cfg_input) 
-                logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
-                logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
-            else:
-                # Not passing explicit attention_mask here; relies on model's internal handling.
-                model_output = MODEL(x) 
-                logits = model_output.logits
+            block_masks_bool_current = torch.zeros_like(x, dtype=torch.bool) 
+            block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x] = \
+                (x[:, current_block_start_idx_in_x:current_block_end_idx_in_x] == MASK_ID)
 
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
-
-            if remasking_strategy == 'low_confidence':
-                if DEVICE == "mps":
-                    probs = F.softmax(logits.to(torch.float32), dim=-1)
-                else:
-                    probs = F.softmax(logits.to(torch.float64), dim=-1)
-                x0_probs = torch.gather(probs, dim=-1, index=x0_predicted_tokens.unsqueeze(-1)).squeeze(-1) 
-            elif remasking_strategy == 'random':
-                if DEVICE == "mps":
-                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float32)
-                else:
-                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float64)
-            else: 
-                yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), f"Error: Unknown remasking strategy '{remasking_strategy}'"
-                return
-
-            confidence_for_selection = torch.full_like(x0_probs, -torch.inf) 
-            candidate_positions_for_unmasking = mask_index_global & block_masks_bool_current
-            confidence_for_selection = torch.where(
-                candidate_positions_for_unmasking,
-                x0_probs,
-                -torch.inf
+            num_transfer_tokens_for_this_block = get_num_transfer_tokens(
+                block_masks_bool_current[:, current_block_start_idx_in_x:current_block_end_idx_in_x],
+                steps_per_block
             )
-            
-            x0_final_candidates = torch.where(mask_index_global, x0_predicted_tokens, x)
 
-            transfer_indices_bool = torch.zeros_like(x, dtype=torch.bool) 
-            num_to_transfer_this_step_batch = num_transfer_tokens_for_this_block[:, i_step_in_block] 
+            for i_step_in_block in range(steps_per_block):
+                abort_msg = check_abort_memory(ram_limit_gb)
+                if abort_msg:
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
+                    return
+                mask_index_global = (x == MASK_ID) 
+                
+                if cfg_scale > 0.:
+                    un_x = x.clone()
+                    # For unconditional pass, mask out the original prompt tokens that are not padding
+                    # raw_prompt_attention_mask is (B, prompt_len)
+                    if raw_prompt_attention_mask is None:
+                        prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                    else:
+                        prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
+                    un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
+                        
+                    x_cfg_input = torch.cat([x, un_x], dim=0)
+                    # Pass attention_mask for CFG if model expects it, covering both parts
+                    # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
+                    model_output = MODEL(x_cfg_input) 
+                    logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
+                    logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
+                else:
+                    # Not passing explicit attention_mask here; relies on model's internal handling.
+                    model_output = MODEL(x) 
+                    logits = model_output.logits
 
-            for j_batch_idx in range(batch_size):
-                k_val = min(num_to_transfer_this_step_batch[j_batch_idx].item(), 
-                            candidate_positions_for_unmasking[j_batch_idx].sum().item()) # ensure k isn't too large
+                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
 
-                if k_val > 0:
-                    # Ensure confidence_for_selection[j_batch_idx] is 1D for topk
-                    conf_slice = confidence_for_selection[j_batch_idx]
-                    if conf_slice.ndim > 1: conf_slice = conf_slice.view(-1) # Should already be 1D from x0_probs
-                    
-                    # Check if there are enough valid (non -inf) confidences
-                    valid_conf_count = (conf_slice > -torch.inf).sum().item()
-                    actual_k = min(k_val, valid_conf_count)
+                if remasking_strategy == 'low_confidence':
+                    x0_probs = selected_probs_from_logits(logits, x0_predicted_tokens)
+                elif remasking_strategy == 'random':
+                    x0_probs = torch.rand(x.shape, device=x.device, dtype=torch.float32)
+                else: 
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), f"Error: Unknown remasking strategy '{remasking_strategy}'"
+                    return
 
-                    if actual_k > 0:
-                        _, topk_indices_in_x = torch.topk(conf_slice, k=actual_k)
-                        transfer_indices_bool[j_batch_idx, topk_indices_in_x] = True
-            
-            x[transfer_indices_bool] = x0_final_candidates[transfer_indices_bool]
+                confidence_for_selection = torch.full_like(x0_probs, -torch.inf) 
+                candidate_positions_for_unmasking = mask_index_global & block_masks_bool_current
+                confidence_for_selection = torch.where(
+                    candidate_positions_for_unmasking,
+                    x0_probs,
+                    -torch.inf
+                )
+                
+                x0_final_candidates = torch.where(mask_index_global, x0_predicted_tokens, x)
 
-            current_total_step = num_block_iter * steps_per_block + i_step_in_block + 1
-            total_overall_steps = num_blocks * steps_per_block
-            status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
-            yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+                transfer_indices_bool = torch.zeros_like(x, dtype=torch.bool) 
+                num_to_transfer_this_step_batch = num_transfer_tokens_for_this_block[:, i_step_in_block] 
 
-    final_generated_ids = x[:, prompt_len:]
-    final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
-    
-    final_text_str = final_text_output[0] if final_text_output and len(final_text_output) > 0 else ""
-    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_str
+                for j_batch_idx in range(batch_size):
+                    k_val = min(num_to_transfer_this_step_batch[j_batch_idx].item(), 
+                                candidate_positions_for_unmasking[j_batch_idx].sum().item()) # ensure k isn't too large
+
+                    if k_val > 0:
+                        # Ensure confidence_for_selection[j_batch_idx] is 1D for topk
+                        conf_slice = confidence_for_selection[j_batch_idx]
+                        if conf_slice.ndim > 1: conf_slice = conf_slice.view(-1) # Should already be 1D from x0_probs
+                        
+                        # Check if there are enough valid (non -inf) confidences
+                        valid_conf_count = (conf_slice > -torch.inf).sum().item()
+                        actual_k = min(k_val, valid_conf_count)
+
+                        if actual_k > 0:
+                            _, topk_indices_in_x = torch.topk(conf_slice, k=actual_k)
+                            transfer_indices_bool[j_batch_idx, topk_indices_in_x] = True
+                
+                x[transfer_indices_bool] = x0_final_candidates[transfer_indices_bool]
+
+                current_total_step = num_block_iter * steps_per_block + i_step_in_block + 1
+                total_overall_steps = num_blocks * steps_per_block
+                status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
+                yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+
+        final_generated_ids = x[:, prompt_len:]
+        final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
+        
+        final_text_str = final_text_output[0] if final_text_output and len(final_text_output) > 0 else ""
+        yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), final_text_str
+    finally:
+        maybe_free_memory(free_cache)
 
 
 css_styles = """
@@ -601,6 +709,14 @@ def toggle_thinking_mode_mmu(current_thinking_mode):
     new_label = "Thinking Mode ✅" if new_state else "Thinking Mode ❌"
     return new_state, gr.update(value=new_label)
 
+def sync_lm_params(gen_length, block_length, steps):
+    block_length, steps = normalize_generation_params(gen_length, block_length, steps, 8, 1024, 1, 512)
+    return gr.update(value=block_length), gr.update(value=steps)
+
+def sync_mmu_params(gen_length, block_length, steps):
+    block_length, steps = normalize_generation_params(gen_length, block_length, steps, 32, 1024, 1, 512)
+    return gr.update(value=block_length), gr.update(value=steps)
+
 
 color_map_config = {
     "MASK": "lightgrey",    
@@ -640,14 +756,15 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             think_button_lm = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    gen_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate.")
-                    steps_slider_lm = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Must be divisible by (gen_length / block_length).")
+                    gen_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
+                    steps_slider_lm = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
                 with gr.Row():
-                    block_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=128, step=32, label="Block Length", info="gen_length must be divisible by this.")
+                    block_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=128, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
                     remasking_dropdown_lm = gr.Dropdown(choices=['low_confidence', 'random'], value='low_confidence', label="Remasking Strategy")
                 with gr.Row():
                     cfg_scale_slider_lm = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="CFG Scale", info="Classifier-Free Guidance. 0 disables it.")
                     temperature_slider_lm = gr.Slider(minimum=0.0, maximum=2.0, value=1, step=0.05, label="Temperature", info="Controls randomness via Gumbel noise. 0 is deterministic.")
+                    free_cache_checkbox_lm = gr.Checkbox(value=False, label="Free Memory After Generation")
                     
 
             with gr.Row():
@@ -671,10 +788,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 256, 512, 128, 1, 0, "low_confidence"],
-            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 256, 512, 64, 1, 0, "low_confidence"]
+            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 256, 512, 128, 1, 0, "low_confidence", False, False],
+            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 256, 512, 64, 1, 0, "low_confidence", False, False]
         ],
-        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm],
+        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm, thinking_mode_lm, free_cache_checkbox_lm],
         outputs=[output_visualization_box_lm, output_final_text_box_lm],
         fn=generate_viz_wrapper_lm,
     )
@@ -691,14 +808,15 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             think_button_mmu = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    gen_length_slider_mmu = gr.Slider(minimum=64, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate.")
-                    steps_slider_mmu = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Must be divisible by (gen_length / block_length).")
+                    gen_length_slider_mmu = gr.Slider(minimum=64, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
+                    steps_slider_mmu = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
                 with gr.Row():
-                    block_length_slider_mmu = gr.Slider(minimum=32, maximum=1024, value=128, step=32, label="Block Length", info="gen_length must be divisible by this.")
+                    block_length_slider_mmu = gr.Slider(minimum=32, maximum=1024, value=128, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
                     remasking_dropdown_mmu = gr.Dropdown(choices=['low_confidence', 'random'], value='low_confidence', label="Remasking Strategy")
                 with gr.Row():
                     cfg_scale_slider_mmu = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="CFG Scale", info="Classifier-Free Guidance. 0 disables it.")
                     temperature_slider_mmu = gr.Slider(minimum=0.0, maximum=2.0, value=1, step=0.05, label="Temperature", info="Controls randomness via Gumbel noise. 0 is deterministic.")
+                    free_cache_checkbox_mmu = gr.Checkbox(value=False, label="Free Memory After Generation")
 
             with gr.Row():
                 image_upload_box = gr.Image(type="pil", label="Upload Image")
@@ -731,7 +849,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 128,
                 1,
                 0,
-                "low_confidence"
+                "low_confidence",
+                False,
+                False
             ],
             [
                 "mmu_validation_2/woman.jpg", 
@@ -741,7 +861,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 128,
                 1,
                 0,
-                "low_confidence"
+                "low_confidence",
+                False,
+                False
             ]
         ],
         inputs=[
@@ -752,7 +874,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             block_length_slider_mmu,
             temperature_slider_mmu,
             cfg_scale_slider_mmu,
-            remasking_dropdown_mmu
+            remasking_dropdown_mmu,
+            thinking_mode_mmu,
+            free_cache_checkbox_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu],
         fn=generate_viz_wrapper,
@@ -766,8 +890,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    steps_slider_t2i = gr.Slider(minimum=5, maximum=100, value=15, step=5, label="Total Sampling Steps", info="Must be divisible by (gen_length / block_length).")
+                    steps_slider_t2i = gr.Slider(minimum=5, maximum=100, value=15, step=5, label="Total Sampling Steps")
                     guidance_scale_slider_t2i = gr.Slider(minimum=0.0, maximum=7.0, value=3.5, step=0.5, label="Guidance Scale", info="Classifier-Free Guidance. 0 disables it.")
+                    free_cache_checkbox_t2i = gr.Checkbox(value=False, label="Free Memory After Generation")
             
             
             with gr.Row():
@@ -789,10 +914,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 15, 3.5, "cosine"],
-            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 15, 3.5, "cosine"]
+            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 15, 3.5, False, "cosine"],
+            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 15, 3.5, False, "cosine"]
         ],
-        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, scheduler_radio_t2i],
+        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, free_cache_checkbox_t2i, scheduler_radio_t2i],
         outputs=[output_image_t2i, output_status_t2i],
         fn=generate_viz_wrapper_t2i,
     )
@@ -803,6 +928,7 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             prompt_input_box_t2i,
             steps_slider_t2i,
             guidance_scale_slider_t2i,
+            free_cache_checkbox_t2i,
             scheduler_radio_t2i
         ],
         outputs=[output_image_t2i, output_status_t2i]
@@ -867,7 +993,8 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             temperature_slider_lm,
             cfg_scale_slider_lm,
             remasking_dropdown_lm,
-            thinking_mode_lm
+            thinking_mode_lm,
+            free_cache_checkbox_lm
         ],
         outputs=[output_visualization_box_lm, output_final_text_box_lm]
     )
@@ -883,9 +1010,48 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             temperature_slider_mmu,
             cfg_scale_slider_mmu,
             remasking_dropdown_mmu,
-            thinking_mode_mmu
+            thinking_mode_mmu,
+            free_cache_checkbox_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu]
+    )
+
+    gen_length_slider_lm.change(
+        fn=sync_lm_params,
+        inputs=[gen_length_slider_lm, block_length_slider_lm, steps_slider_lm],
+        outputs=[block_length_slider_lm, steps_slider_lm],
+        queue=False
+    )
+    block_length_slider_lm.change(
+        fn=sync_lm_params,
+        inputs=[gen_length_slider_lm, block_length_slider_lm, steps_slider_lm],
+        outputs=[block_length_slider_lm, steps_slider_lm],
+        queue=False
+    )
+    steps_slider_lm.change(
+        fn=sync_lm_params,
+        inputs=[gen_length_slider_lm, block_length_slider_lm, steps_slider_lm],
+        outputs=[block_length_slider_lm, steps_slider_lm],
+        queue=False
+    )
+
+    gen_length_slider_mmu.change(
+        fn=sync_mmu_params,
+        inputs=[gen_length_slider_mmu, block_length_slider_mmu, steps_slider_mmu],
+        outputs=[block_length_slider_mmu, steps_slider_mmu],
+        queue=False
+    )
+    block_length_slider_mmu.change(
+        fn=sync_mmu_params,
+        inputs=[gen_length_slider_mmu, block_length_slider_mmu, steps_slider_mmu],
+        outputs=[block_length_slider_mmu, steps_slider_mmu],
+        queue=False
+    )
+    steps_slider_mmu.change(
+        fn=sync_mmu_params,
+        inputs=[gen_length_slider_mmu, block_length_slider_mmu, steps_slider_mmu],
+        outputs=[block_length_slider_mmu, steps_slider_mmu],
+        queue=False
     )
 
 
