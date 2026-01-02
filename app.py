@@ -4,6 +4,9 @@ import numpy as np
 import torch.nn.functional as F
 import gc
 import os
+import sys
+from contextlib import nullcontext
+import importlib
 from transformers import AutoTokenizer
 from torchvision import transforms
 from models import MAGVITv2, get_mask_schedule, MMadaModelLM
@@ -65,6 +68,18 @@ def maybe_free_memory(enabled):
     if hasattr(torch, "mps") and torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
+def fp8_autocast(enabled):
+    if not enabled:
+        return nullcontext()
+    try:
+        te = importlib.import_module("transformer_engine.pytorch")
+    except Exception as e:
+        raise RuntimeError(
+            "FP8 requires transformer_engine.pytorch in this Python environment "
+            f"({sys.executable}). Import error: {e}"
+        )
+    return te.fp8_autocast(enabled=True)
+
 def get_rss_bytes():
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as f:
@@ -77,16 +92,24 @@ def get_rss_bytes():
         return None
     return None
 
-def check_abort_memory(limit_gb):
+def get_vram_bytes():
+    if not torch.cuda.is_available():
+        return None
+    device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    return max(allocated, reserved)
+
+def check_abort_vram(limit_gb):
     if not limit_gb:
         return None
-    rss = get_rss_bytes()
-    if rss is None:
+    vram = get_vram_bytes()
+    if vram is None:
         return None
     limit_bytes = int(limit_gb * (1024 ** 3))
-    if rss > limit_bytes:
-        rss_gb = rss / (1024 ** 3)
-        return f"Aborted: RAM usage {rss_gb:.1f} GB exceeded limit {limit_gb} GB."
+    if vram > limit_bytes:
+        vram_gb = vram / (1024 ** 3)
+        return f"Aborted: VRAM usage {vram_gb:.1f} GB exceeded limit {limit_gb} GB."
     return None
 
 def _snap_block_length(gen_length, block_length, min_val, max_val):
@@ -232,7 +255,7 @@ def get_highlighted_text_tuples(current_x_ids_batch, prompt_input_ids, prompt_le
     return intermediate_tuples
 
 @torch.no_grad()
-def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abort_on_ram, mask_schedule="cosine"):
+def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abort_on_ram, use_fp8, mask_schedule="cosine"):
     global MODEL, TOKENIZER, MASK_ID, DEVICE, uni_prompting
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -256,25 +279,32 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
     last_image = blank_image
     ram_limit_gb = 96 if abort_on_ram else 0
     try:
-        for image_step, status_msg_step in MODEL.t2i_generate_decoding_stepwise(
-                input_ids = input_ids,
-                uncond_input_ids = uncond_input_ids,    
-                attention_mask = attention_mask,
-                uncond_attention_mask = uncond_attention_mask,
-                temperature=1.0,
-                timesteps = steps,
-                guidance_scale = guidance_scale,
-                noise_schedule = mask_schedule,
-                noise_type = "mask",
-                seq_len = 1024,
-                vq_model = VQ_MODEL,
-                uni_prompting=uni_prompting):
-            last_image = image_step
-            abort_msg = check_abort_memory(ram_limit_gb)
+        try:
+            ctx = fp8_autocast(use_fp8)
+        except RuntimeError as e:
+            yield last_image, str(e)
+            return
+        with ctx:
+            for image_step, status_msg_step in MODEL.t2i_generate_decoding_stepwise(
+                    input_ids = input_ids,
+                    uncond_input_ids = uncond_input_ids,    
+                    attention_mask = attention_mask,
+                    uncond_attention_mask = uncond_attention_mask,
+                    temperature=1.0,
+                    timesteps = steps,
+                    guidance_scale = guidance_scale,
+                    noise_schedule = mask_schedule,
+                    noise_type = "mask",
+                    seq_len = 1024,
+                    vq_model = VQ_MODEL,
+                    uni_prompting=uni_prompting):
+                last_image = image_step
+            abort_msg = check_abort_vram(ram_limit_gb)
             if abort_msg:
                 yield last_image, abort_msg
+                maybe_free_memory(True)
                 return
-            yield image_step, status_msg_step
+                yield image_step, status_msg_step
     finally:
         maybe_free_memory(free_cache)
     
@@ -283,7 +313,7 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
 
 @torch.no_grad()
 def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_lm, free_cache, abort_on_ram): 
+                         cfg_scale, remasking_strategy, thinking_mode_lm, free_cache, abort_on_ram, use_fp8): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
     print(f"thinking_mode_lm: {thinking_mode_lm}")
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -373,32 +403,39 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
             )
 
             for i_step_in_block in range(steps_per_block):
-                abort_msg = check_abort_memory(ram_limit_gb)
+                abort_msg = check_abort_vram(ram_limit_gb)
                 if abort_msg:
                     yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
+                    maybe_free_memory(True)
                     return
                 mask_index_global = (x == MASK_ID) 
                         
-                if cfg_scale > 0.:
-                    un_x = x.clone()
-                    # For unconditional pass, mask out the original prompt tokens that are not padding
-                    # raw_prompt_attention_mask is (B, prompt_len)
-                    if raw_prompt_attention_mask is None:
-                        prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                try:
+                    ctx = fp8_autocast(use_fp8)
+                except RuntimeError as e:
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), str(e)
+                    return
+                with ctx:
+                    if cfg_scale > 0.:
+                        un_x = x.clone()
+                        # For unconditional pass, mask out the original prompt tokens that are not padding
+                        # raw_prompt_attention_mask is (B, prompt_len)
+                        if raw_prompt_attention_mask is None:
+                            prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                        else:
+                            prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
+                        un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
+                            
+                        x_cfg_input = torch.cat([x, un_x], dim=0)
+                        # Pass attention_mask for CFG if model expects it, covering both parts
+                        # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
+                        model_output = MODEL(x_cfg_input) 
+                        logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
+                        logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
                     else:
-                        prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
-                    un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
-                        
-                    x_cfg_input = torch.cat([x, un_x], dim=0)
-                    # Pass attention_mask for CFG if model expects it, covering both parts
-                    # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
-                    model_output = MODEL(x_cfg_input) 
-                    logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
-                    logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
-                else:
-                    # Not passing explicit attention_mask here; relies on model's internal handling.
-                    model_output = MODEL(x) 
-                    logits = model_output.logits
+                        # Not passing explicit attention_mask here; relies on model's internal handling.
+                        model_output = MODEL(x) 
+                        logits = model_output.logits
 
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
@@ -458,7 +495,7 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
 
 @torch.no_grad()
 def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_mmu, free_cache, abort_on_ram): 
+                         cfg_scale, remasking_strategy, thinking_mode_mmu, free_cache, abort_on_ram, use_fp8): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -576,32 +613,39 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
             )
 
             for i_step_in_block in range(steps_per_block):
-                abort_msg = check_abort_memory(ram_limit_gb)
+                abort_msg = check_abort_vram(ram_limit_gb)
                 if abort_msg:
                     yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
+                    maybe_free_memory(True)
                     return
                 mask_index_global = (x == MASK_ID) 
                 
-                if cfg_scale > 0.:
-                    un_x = x.clone()
-                    # For unconditional pass, mask out the original prompt tokens that are not padding
-                    # raw_prompt_attention_mask is (B, prompt_len)
-                    if raw_prompt_attention_mask is None:
-                        prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                try:
+                    ctx = fp8_autocast(use_fp8)
+                except RuntimeError as e:
+                    yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), str(e)
+                    return
+                with ctx:
+                    if cfg_scale > 0.:
+                        un_x = x.clone()
+                        # For unconditional pass, mask out the original prompt tokens that are not padding
+                        # raw_prompt_attention_mask is (B, prompt_len)
+                        if raw_prompt_attention_mask is None:
+                            prompt_active_tokens_mask = (input_ids != TOKENIZER.pad_token_id)
+                        else:
+                            prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
+                        un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
+                            
+                        x_cfg_input = torch.cat([x, un_x], dim=0)
+                        # Pass attention_mask for CFG if model expects it, covering both parts
+                        # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
+                        model_output = MODEL(x_cfg_input) 
+                        logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
+                        logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
                     else:
-                        prompt_active_tokens_mask = raw_prompt_attention_mask.bool()
-                    un_x[:, :prompt_len][prompt_active_tokens_mask] = MASK_ID
-                        
-                    x_cfg_input = torch.cat([x, un_x], dim=0)
-                    # Pass attention_mask for CFG if model expects it, covering both parts
-                    # For simplicity, not passing explicit attention_mask here; relies on model's internal handling.
-                    model_output = MODEL(x_cfg_input) 
-                    logits_cond, logits_uncond = torch.chunk(model_output.logits, 2, dim=0)
-                    logits = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
-                else:
-                    # Not passing explicit attention_mask here; relies on model's internal handling.
-                    model_output = MODEL(x) 
-                    logits = model_output.logits
+                        # Not passing explicit attention_mask here; relies on model's internal handling.
+                        model_output = MODEL(x) 
+                        logits = model_output.logits
 
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
@@ -717,6 +761,21 @@ def sync_mmu_params(gen_length, block_length, steps):
     block_length, steps = normalize_generation_params(gen_length, block_length, steps, 32, 1024, 1, 512)
     return gr.update(value=block_length), gr.update(value=steps)
 
+def apply_fast_mode_lm(enabled):
+    if not enabled:
+        return gr.update(), gr.update(), gr.update()
+    return gr.update(value=256), gr.update(value=64), gr.update(value=64)
+
+def apply_fast_mode_mmu(enabled):
+    if not enabled:
+        return gr.update(), gr.update(), gr.update()
+    return gr.update(value=256), gr.update(value=64), gr.update(value=64)
+
+def apply_fast_mode_t2i(enabled):
+    if not enabled:
+        return gr.update(), gr.update()
+    return gr.update(value=10), gr.update(value=2.5)
+
 
 color_map_config = {
     "MASK": "lightgrey",    
@@ -756,15 +815,19 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             think_button_lm = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    gen_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
-                    steps_slider_lm = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
+                    gen_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=256, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
+                    steps_slider_lm = gr.Slider(minimum=1, maximum=512, value=64, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
                 with gr.Row():
-                    block_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=128, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
+                    block_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=64, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
                     remasking_dropdown_lm = gr.Dropdown(choices=['low_confidence', 'random'], value='low_confidence', label="Remasking Strategy")
                 with gr.Row():
                     cfg_scale_slider_lm = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="CFG Scale", info="Classifier-Free Guidance. 0 disables it.")
                     temperature_slider_lm = gr.Slider(minimum=0.0, maximum=2.0, value=1, step=0.05, label="Temperature", info="Controls randomness via Gumbel noise. 0 is deterministic.")
                     free_cache_checkbox_lm = gr.Checkbox(value=False, label="Free Memory After Generation")
+                    abort_ram_checkbox_lm = gr.Checkbox(value=True, label="Abort if VRAM > 96 GB")
+                with gr.Row():
+                    fast_mode_checkbox_lm = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
+                    fp8_checkbox_lm = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
                     
 
             with gr.Row():
@@ -788,10 +851,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 256, 512, 128, 1, 0, "low_confidence", False, False],
-            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 256, 512, 64, 1, 0, "low_confidence", False, False]
+            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True],
+            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True]
         ],
-        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm, thinking_mode_lm, free_cache_checkbox_lm],
+        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm, thinking_mode_lm, free_cache_checkbox_lm, abort_ram_checkbox_lm, fp8_checkbox_lm],
         outputs=[output_visualization_box_lm, output_final_text_box_lm],
         fn=generate_viz_wrapper_lm,
     )
@@ -808,15 +871,19 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             think_button_mmu = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    gen_length_slider_mmu = gr.Slider(minimum=64, maximum=1024, value=512, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
-                    steps_slider_mmu = gr.Slider(minimum=1, maximum=512, value=256, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
+                    gen_length_slider_mmu = gr.Slider(minimum=64, maximum=1024, value=256, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
+                    steps_slider_mmu = gr.Slider(minimum=1, maximum=512, value=64, step=32, label="Total Sampling Steps", info="Auto-snaps to a valid multiple of (gen_length / block_length).")
                 with gr.Row():
-                    block_length_slider_mmu = gr.Slider(minimum=32, maximum=1024, value=128, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
+                    block_length_slider_mmu = gr.Slider(minimum=32, maximum=1024, value=64, step=32, label="Block Length", info="Auto-snaps to a divisor of gen_length.")
                     remasking_dropdown_mmu = gr.Dropdown(choices=['low_confidence', 'random'], value='low_confidence', label="Remasking Strategy")
                 with gr.Row():
                     cfg_scale_slider_mmu = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="CFG Scale", info="Classifier-Free Guidance. 0 disables it.")
                     temperature_slider_mmu = gr.Slider(minimum=0.0, maximum=2.0, value=1, step=0.05, label="Temperature", info="Controls randomness via Gumbel noise. 0 is deterministic.")
                     free_cache_checkbox_mmu = gr.Checkbox(value=False, label="Free Memory After Generation")
+                    abort_ram_checkbox_mmu = gr.Checkbox(value=True, label="Abort if VRAM > 96 GB")
+                with gr.Row():
+                    fast_mode_checkbox_mmu = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
+                    fp8_checkbox_mmu = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
 
             with gr.Row():
                 image_upload_box = gr.Image(type="pil", label="Upload Image")
@@ -844,26 +911,30 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             [
                 "mmu_validation_2/sunflower.jpg",
                 "Please describe this image in detail.",
+                64,
                 256,
-                512,
-                128,
+                64,
                 1,
                 0,
                 "low_confidence",
                 False,
-                False
+                False,
+                False,
+                True
             ],
             [
                 "mmu_validation_2/woman.jpg", 
                 "Please describe this image in detail.",
+                64,
                 256,
-                512,
-                128,
+                64,
                 1,
                 0,
                 "low_confidence",
                 False,
-                False
+                False,
+                False,
+                True
             ]
         ],
         inputs=[
@@ -876,7 +947,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             cfg_scale_slider_mmu,
             remasking_dropdown_mmu,
             thinking_mode_mmu,
-            free_cache_checkbox_mmu
+            free_cache_checkbox_mmu,
+            abort_ram_checkbox_mmu,
+            fp8_checkbox_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu],
         fn=generate_viz_wrapper,
@@ -890,9 +963,13 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
-                    steps_slider_t2i = gr.Slider(minimum=5, maximum=100, value=15, step=5, label="Total Sampling Steps")
-                    guidance_scale_slider_t2i = gr.Slider(minimum=0.0, maximum=7.0, value=3.5, step=0.5, label="Guidance Scale", info="Classifier-Free Guidance. 0 disables it.")
+                    steps_slider_t2i = gr.Slider(minimum=5, maximum=100, value=10, step=5, label="Total Sampling Steps")
+                    guidance_scale_slider_t2i = gr.Slider(minimum=0.0, maximum=7.0, value=2.5, step=0.5, label="Guidance Scale", info="Classifier-Free Guidance. 0 disables it.")
                     free_cache_checkbox_t2i = gr.Checkbox(value=False, label="Free Memory After Generation")
+                    abort_ram_checkbox_t2i = gr.Checkbox(value=True, label="Abort if VRAM > 96 GB")
+                with gr.Row():
+                    fast_mode_checkbox_t2i = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
+                    fp8_checkbox_t2i = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
             
             
             with gr.Row():
@@ -914,10 +991,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 15, 3.5, False, "cosine"],
-            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 15, 3.5, False, "cosine"]
+            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 10, 2.5, False, False, True, "cosine"],
+            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 10, 2.5, False, False, True, "cosine"]
         ],
-        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, free_cache_checkbox_t2i, scheduler_radio_t2i],
+        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, free_cache_checkbox_t2i, abort_ram_checkbox_t2i, fp8_checkbox_t2i, scheduler_radio_t2i],
         outputs=[output_image_t2i, output_status_t2i],
         fn=generate_viz_wrapper_t2i,
     )
@@ -929,6 +1006,8 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             steps_slider_t2i,
             guidance_scale_slider_t2i,
             free_cache_checkbox_t2i,
+            abort_ram_checkbox_t2i,
+            fp8_checkbox_t2i,
             scheduler_radio_t2i
         ],
         outputs=[output_image_t2i, output_status_t2i]
@@ -994,7 +1073,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             cfg_scale_slider_lm,
             remasking_dropdown_lm,
             thinking_mode_lm,
-            free_cache_checkbox_lm
+            free_cache_checkbox_lm,
+            abort_ram_checkbox_lm,
+            fp8_checkbox_lm
         ],
         outputs=[output_visualization_box_lm, output_final_text_box_lm]
     )
@@ -1011,7 +1092,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             cfg_scale_slider_mmu,
             remasking_dropdown_mmu,
             thinking_mode_mmu,
-            free_cache_checkbox_mmu
+            free_cache_checkbox_mmu,
+            abort_ram_checkbox_mmu,
+            fp8_checkbox_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu]
     )
@@ -1051,6 +1134,25 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
         fn=sync_mmu_params,
         inputs=[gen_length_slider_mmu, block_length_slider_mmu, steps_slider_mmu],
         outputs=[block_length_slider_mmu, steps_slider_mmu],
+        queue=False
+    )
+
+    fast_mode_checkbox_lm.change(
+        fn=apply_fast_mode_lm,
+        inputs=[fast_mode_checkbox_lm],
+        outputs=[gen_length_slider_lm, block_length_slider_lm, steps_slider_lm],
+        queue=False
+    )
+    fast_mode_checkbox_mmu.change(
+        fn=apply_fast_mode_mmu,
+        inputs=[fast_mode_checkbox_mmu],
+        outputs=[gen_length_slider_mmu, block_length_slider_mmu, steps_slider_mmu],
+        queue=False
+    )
+    fast_mode_checkbox_t2i.change(
+        fn=apply_fast_mode_t2i,
+        inputs=[fast_mode_checkbox_t2i],
+        outputs=[steps_slider_t2i, guidance_scale_slider_t2i],
         queue=False
     )
 
