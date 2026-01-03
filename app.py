@@ -68,6 +68,31 @@ def maybe_free_memory(enabled):
     if hasattr(torch, "mps") and torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
+def _format_bytes(num_bytes):
+    if num_bytes is None:
+        return "n/a"
+    return f"{num_bytes / (1024 ** 3):.2f} GB"
+
+def log_debug(enabled, tag, **kwargs):
+    if not enabled:
+        return
+    parts = [f"{k}={v}" for k, v in kwargs.items()]
+    print(f"[debug:{tag}] " + " ".join(parts))
+
+def maybe_trim_vram(trim_interval, step_index):
+    if trim_interval is None:
+        return
+    try:
+        trim_interval = int(trim_interval)
+    except (TypeError, ValueError):
+        return
+    if trim_interval <= 0:
+        return
+    if ((step_index + 1) % trim_interval) != 0:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def fp8_autocast(enabled):
     if not enabled:
         return nullcontext()
@@ -174,14 +199,62 @@ def _load_model_and_tokenizer_core(model_path_to_load, model_display_name_for_st
     CURRENT_MODEL_PATH = model_path_to_load 
 
     status_msg_parts = [f"Loading '{model_display_name_for_status}'..."]
+    import time
+    t_start = time.time()
     try:
+        t0 = time.time()
         TOKENIZER = AutoTokenizer.from_pretrained(model_path_to_load, trust_remote_code=True)
+        status_msg_parts.append(f"Tokenizer loaded in {time.time() - t0:.2f}s.")
         status_msg_parts.append(f"Tokenizer for '{model_display_name_for_status}' loaded.")
 
-        MODEL = MMadaModelLM.from_pretrained(model_path_to_load, trust_remote_code=True, torch_dtype=torch.bfloat16).to(DEVICE).eval()
+        t0 = time.time()
+        model_on_device = False
+        if DEVICE == "cuda":
+            try:
+                MODEL = MMadaModelLM.from_pretrained(
+                    model_path_to_load,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    device_map="cuda",
+                    low_cpu_mem_usage=True,
+                )
+                model_on_device = True
+                status_msg_parts.append("Model loaded directly to CUDA with device_map.")
+            except Exception as e:
+                status_msg_parts.append(f"Direct CUDA load failed, falling back to CPU load: {e}")
+                MODEL = MMadaModelLM.from_pretrained(
+                    model_path_to_load,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                )
+        else:
+            MODEL = MMadaModelLM.from_pretrained(
+                model_path_to_load,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+        status_msg_parts.append(f"Model weights loaded in {time.time() - t0:.2f}s.")
+
+        if model_on_device:
+            MODEL = MODEL.eval()
+        else:
+            t0 = time.time()
+            MODEL = MODEL.to(DEVICE).eval()
+            status_msg_parts.append(f"Model moved to {DEVICE} in {time.time() - t0:.2f}s.")
         status_msg_parts.append(f"Model '{model_display_name_for_status}' loaded to {DEVICE}.")
 
-        uni_prompting = UniversalPrompting(TOKENIZER, max_text_len=512, special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),ignore_id=-100, cond_dropout_prob=0.1, use_reserved_token=True)
+        t0 = time.time()
+        uni_prompting = UniversalPrompting(
+            TOKENIZER,
+            max_text_len=512,
+            special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
+            ignore_id=-100,
+            cond_dropout_prob=0.1,
+            use_reserved_token=True
+        )
+        status_msg_parts.append(f"Prompting utils init in {time.time() - t0:.2f}s.")
         
         if hasattr(TOKENIZER, 'mask_token_id') and TOKENIZER.mask_token_id is not None:
             MASK_ID = TOKENIZER.mask_token_id
@@ -203,6 +276,7 @@ def _load_model_and_tokenizer_core(model_path_to_load, model_display_name_for_st
 
         TOKENIZER.chat_template = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|>\n' }}"
         
+        status_msg_parts.append(f"Total load time {time.time() - t_start:.2f}s.")
         return " ".join(status_msg_parts)
     except Exception as e:
         MODEL = None
@@ -255,7 +329,7 @@ def get_highlighted_text_tuples(current_x_ids_batch, prompt_input_ids, prompt_le
     return intermediate_tuples
 
 @torch.no_grad()
-def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abort_on_ram, use_fp8, mask_schedule="cosine"):
+def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, num_vq_tokens, free_cache, abort_on_ram, use_fp8, debug_stats, trim_interval, mask_schedule="cosine"):
     global MODEL, TOKENIZER, MASK_ID, DEVICE, uni_prompting
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -264,7 +338,8 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
     steps = int(steps)
     guidance_scale = float(guidance_scale)
 
-    image_tokens = torch.ones((1, 1024), dtype=torch.long, device=DEVICE) * MASK_ID
+    num_vq_tokens = int(num_vq_tokens)
+    image_tokens = torch.ones((1, num_vq_tokens), dtype=torch.long, device=DEVICE) * MASK_ID
     prompt_text = [prompt_text]
     input_ids, attention_mask = uni_prompting((prompt_text, image_tokens), 't2i_gen')
 
@@ -278,6 +353,15 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
     yield blank_image, "Starting generation..."
     last_image = blank_image
     ram_limit_gb = 96 if abort_on_ram else 0
+    log_debug(
+        debug_stats,
+        "t2i_start",
+        steps=steps,
+        guidance_scale=guidance_scale,
+        num_vq_tokens=num_vq_tokens,
+        vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+        vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+    )
     try:
         try:
             ctx = fp8_autocast(use_fp8)
@@ -285,7 +369,7 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
             yield last_image, str(e)
             return
         with ctx:
-            for image_step, status_msg_step in MODEL.t2i_generate_decoding_stepwise(
+            for step_idx, (image_step, status_msg_step) in enumerate(MODEL.t2i_generate_decoding_stepwise(
                     input_ids = input_ids,
                     uncond_input_ids = uncond_input_ids,    
                     attention_mask = attention_mask,
@@ -295,15 +379,23 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
                     guidance_scale = guidance_scale,
                     noise_schedule = mask_schedule,
                     noise_type = "mask",
-                    seq_len = 1024,
+                    seq_len = num_vq_tokens,
                     vq_model = VQ_MODEL,
-                    uni_prompting=uni_prompting):
+                    uni_prompting=uni_prompting)):
                 last_image = image_step
-            abort_msg = check_abort_vram(ram_limit_gb)
-            if abort_msg:
-                yield last_image, abort_msg
-                maybe_free_memory(True)
-                return
+                log_debug(
+                    debug_stats,
+                    "t2i_step",
+                    status=status_msg_step,
+                    vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+                    vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+                )
+                maybe_trim_vram(trim_interval, step_idx)
+                abort_msg = check_abort_vram(ram_limit_gb)
+                if abort_msg:
+                    yield last_image, abort_msg
+                    maybe_free_memory(True)
+                    return
                 yield image_step, status_msg_step
     finally:
         maybe_free_memory(free_cache)
@@ -313,7 +405,7 @@ def generate_viz_wrapper_t2i(prompt_text, steps, guidance_scale, free_cache, abo
 
 @torch.no_grad()
 def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_lm, free_cache, abort_on_ram, use_fp8): 
+                         cfg_scale, remasking_strategy, thinking_mode_lm, free_cache, abort_on_ram, use_fp8, debug_stats, trim_interval): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
     print(f"thinking_mode_lm: {thinking_mode_lm}")
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -387,9 +479,21 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
         return
     steps_per_block = steps // num_blocks
     ram_limit_gb = 96 if abort_on_ram else 0
+    log_debug(
+        debug_stats,
+        "lm_start",
+        prompt_len=prompt_len,
+        gen_length=gen_length,
+        block_length=block_length,
+        steps=steps,
+        steps_per_block=steps_per_block,
+        vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+        vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+    )
     
     try:
         for num_block_iter in range(num_blocks):
+            log_debug(debug_stats, "lm_block", block=num_block_iter, num_blocks=num_blocks)
             current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
             current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
             
@@ -403,6 +507,14 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
             )
 
             for i_step_in_block in range(steps_per_block):
+                log_debug(
+                    debug_stats,
+                    "lm_step",
+                    block=num_block_iter,
+                    step=i_step_in_block,
+                    vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+                    vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+                )
                 abort_msg = check_abort_vram(ram_limit_gb)
                 if abort_msg:
                     yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
@@ -437,6 +549,11 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
                         model_output = MODEL(x) 
                         logits = model_output.logits
 
+                log_debug(
+                    debug_stats,
+                    "lm_logits",
+                    logits_shape=tuple(logits.shape),
+                )
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
 
@@ -484,6 +601,7 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
                 total_overall_steps = num_blocks * steps_per_block
                 status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
                 yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+                maybe_trim_vram(trim_interval, i_step_in_block)
 
         final_generated_ids = x[:, prompt_len:]
         final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
@@ -495,7 +613,7 @@ def generate_viz_wrapper_lm(prompt_text, steps, gen_length, block_length, temper
 
 @torch.no_grad()
 def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, block_length, temperature,
-                         cfg_scale, remasking_strategy, thinking_mode_mmu, free_cache, abort_on_ram, use_fp8): 
+                         cfg_scale, remasking_strategy, thinking_mode_mmu, free_cache, abort_on_ram, use_fp8, debug_stats, trim_interval): 
     global MODEL, TOKENIZER, MASK_ID, DEVICE
 
     if MODEL is None or TOKENIZER is None or MASK_ID is None:
@@ -597,9 +715,21 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
         return
     steps_per_block = steps // num_blocks
     ram_limit_gb = 96 if abort_on_ram else 0
+    log_debug(
+        debug_stats,
+        "mmu_start",
+        prompt_len=prompt_len,
+        gen_length=gen_length,
+        block_length=block_length,
+        steps=steps,
+        steps_per_block=steps_per_block,
+        vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+        vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+    )
     
     try:
         for num_block_iter in range(num_blocks):
+            log_debug(debug_stats, "mmu_block", block=num_block_iter, num_blocks=num_blocks)
             current_block_start_idx_in_x = prompt_len + num_block_iter * block_length
             current_block_end_idx_in_x = prompt_len + (num_block_iter + 1) * block_length
             
@@ -613,6 +743,14 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
             )
 
             for i_step_in_block in range(steps_per_block):
+                log_debug(
+                    debug_stats,
+                    "mmu_step",
+                    block=num_block_iter,
+                    step=i_step_in_block,
+                    vram_alloc=_format_bytes(torch.cuda.memory_allocated()) if torch.cuda.is_available() else "n/a",
+                    vram_reserved=_format_bytes(torch.cuda.memory_reserved()) if torch.cuda.is_available() else "n/a",
+                )
                 abort_msg = check_abort_vram(ram_limit_gb)
                 if abort_msg:
                     yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), abort_msg
@@ -647,6 +785,11 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
                         model_output = MODEL(x) 
                         logits = model_output.logits
 
+                log_debug(
+                    debug_stats,
+                    "mmu_logits",
+                    logits_shape=tuple(logits.shape),
+                )
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0_predicted_tokens = torch.argmax(logits_with_noise, dim=-1) 
 
@@ -694,6 +837,7 @@ def generate_viz_wrapper(uploaded_image_pil, prompt_text, steps, gen_length, blo
                 total_overall_steps = num_blocks * steps_per_block
                 status_msg = f"Block {num_block_iter+1}/{num_blocks}, Step {i_step_in_block+1}/{steps_per_block} (Total: {current_total_step}/{total_overall_steps})"
                 yield get_highlighted_text_tuples(x, input_ids, prompt_len, TOKENIZER, MASK_ID, raw_prompt_attention_mask), status_msg
+                maybe_trim_vram(trim_interval, i_step_in_block)
 
         final_generated_ids = x[:, prompt_len:]
         final_text_output = TOKENIZER.batch_decode(final_generated_ids, skip_special_tokens=True)
@@ -773,8 +917,8 @@ def apply_fast_mode_mmu(enabled):
 
 def apply_fast_mode_t2i(enabled):
     if not enabled:
-        return gr.update(), gr.update()
-    return gr.update(value=10), gr.update(value=2.5)
+        return gr.update(), gr.update(), gr.update()
+    return gr.update(value=10), gr.update(value=2.5), gr.update(value=256)
 
 
 color_map_config = {
@@ -788,8 +932,6 @@ theme = gr.themes.Ocean(
 with gr.Blocks(css=css_styles, theme=theme) as demo:
 # with gr.Blocks(css=css_styles, theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky)) as demo:
 # with gr.Blocks() as demo:
-    thinking_mode_lm = gr.State(False)
-    thinking_mode_mmu = gr.State(False)
     gr.Markdown("<h1 style='text-align: center; margin-bottom: 20px;'>MMaDA: Multimodal Large Diffusion Language Models</h1>")
     gr.Markdown("MMaDA is a novel class of multimodal diffusion foundation models designed to achieve superior performance across diverse domains such as textual reasoning, multimodal understanding, and text-to-image generation")
     gr.Markdown("Github: [Gen-Verse/MMaDA](https://github.com/Gen-Verse/MMaDA)")
@@ -813,6 +955,7 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
         with gr.Column(scale=2): 
             prompt_input_box_lm = gr.Textbox(label="Enter your prompt:", lines=3, value="A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?")
             think_button_lm = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
+            thinking_mode_checkbox_lm = gr.Checkbox(value=False, label="Thinking Mode", visible=False)
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
                     gen_length_slider_lm = gr.Slider(minimum=8, maximum=1024, value=256, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
@@ -828,6 +971,15 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 with gr.Row():
                     fast_mode_checkbox_lm = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
                     fp8_checkbox_lm = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
+                    debug_checkbox_lm = gr.Checkbox(value=False, label="Debug Stats")
+                    trim_vram_slider_lm = gr.Slider(
+                        minimum=1,
+                        maximum=64,
+                        value=1,
+                        step=1,
+                        label="Trim VRAM Cache Every N Steps",
+                        info="1=every step, set to steps_per_block for per-block trimming."
+                    )
                     
 
             with gr.Row():
@@ -851,10 +1003,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True],
-            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True]
+            ["A rectangular prism has a length of 5 units, a width of 4 units, and a height of 3 units. What is the volume of the prism?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True, False, 1],
+            ["Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?", 64, 256, 64, 1, 0, "low_confidence", False, False, False, True, False, 1]
         ],
-        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm, thinking_mode_lm, free_cache_checkbox_lm, abort_ram_checkbox_lm, fp8_checkbox_lm],
+        inputs=[prompt_input_box_lm, steps_slider_lm, gen_length_slider_lm, block_length_slider_lm, temperature_slider_lm, cfg_scale_slider_lm, remasking_dropdown_lm, thinking_mode_checkbox_lm, free_cache_checkbox_lm, abort_ram_checkbox_lm, fp8_checkbox_lm, debug_checkbox_lm, trim_vram_slider_lm],
         outputs=[output_visualization_box_lm, output_final_text_box_lm],
         fn=generate_viz_wrapper_lm,
     )
@@ -869,6 +1021,7 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 value="Please describe this image in detail."
             )
             think_button_mmu = gr.Button("🧠 Enable Thinking Mode", elem_id="think_btn")
+            thinking_mode_checkbox_mmu = gr.Checkbox(value=False, label="Thinking Mode", visible=False)
             with gr.Accordion("Generation Parameters", open=True):
                 with gr.Row():
                     gen_length_slider_mmu = gr.Slider(minimum=64, maximum=1024, value=256, step=64, label="Generation Length", info="Number of tokens to generate. Auto-snaps to valid block/step combos.")
@@ -884,6 +1037,15 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 with gr.Row():
                     fast_mode_checkbox_mmu = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
                     fp8_checkbox_mmu = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
+                    debug_checkbox_mmu = gr.Checkbox(value=False, label="Debug Stats")
+                    trim_vram_slider_mmu = gr.Slider(
+                        minimum=1,
+                        maximum=64,
+                        value=1,
+                        step=1,
+                        label="Trim VRAM Cache Every N Steps",
+                        info="1=every step, set to steps_per_block for per-block trimming."
+                    )
 
             with gr.Row():
                 image_upload_box = gr.Image(type="pil", label="Upload Image")
@@ -920,7 +1082,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 False,
                 False,
                 False,
-                True
+                True,
+                False,
+                1
             ],
             [
                 "mmu_validation_2/woman.jpg", 
@@ -934,7 +1098,9 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 False,
                 False,
                 False,
-                True
+                True,
+                False,
+                1
             ]
         ],
         inputs=[
@@ -946,10 +1112,12 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             temperature_slider_mmu,
             cfg_scale_slider_mmu,
             remasking_dropdown_mmu,
-            thinking_mode_mmu,
+            thinking_mode_checkbox_mmu,
             free_cache_checkbox_mmu,
             abort_ram_checkbox_mmu,
-            fp8_checkbox_mmu
+            fp8_checkbox_mmu,
+            debug_checkbox_mmu,
+            trim_vram_slider_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu],
         fn=generate_viz_wrapper,
@@ -965,11 +1133,28 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
                 with gr.Row():
                     steps_slider_t2i = gr.Slider(minimum=5, maximum=100, value=10, step=5, label="Total Sampling Steps")
                     guidance_scale_slider_t2i = gr.Slider(minimum=0.0, maximum=7.0, value=2.5, step=0.5, label="Guidance Scale", info="Classifier-Free Guidance. 0 disables it.")
+                    num_vq_tokens_slider_t2i = gr.Slider(
+                        minimum=256,
+                        maximum=1024,
+                        value=256,
+                        step=256,
+                        label="Image Tokens (num_vq_tokens)",
+                        info="Higher values increase resolution and VRAM (recommended: 256/512/1024)."
+                    )
                     free_cache_checkbox_t2i = gr.Checkbox(value=False, label="Free Memory After Generation")
                     abort_ram_checkbox_t2i = gr.Checkbox(value=True, label="Abort if VRAM > 96 GB")
                 with gr.Row():
                     fast_mode_checkbox_t2i = gr.Checkbox(value=True, label="Fast Mode (lower RAM/latency)")
                     fp8_checkbox_t2i = gr.Checkbox(value=True, label="FP8 Compute (Transformer Engine)")
+                    debug_checkbox_t2i = gr.Checkbox(value=False, label="Debug Stats")
+                    trim_vram_slider_t2i = gr.Slider(
+                        minimum=1,
+                        maximum=64,
+                        value=1,
+                        step=1,
+                        label="Trim VRAM Cache Every N Steps",
+                        info="1=every step, set to steps for per-run trimming."
+                    )
             
             
             with gr.Row():
@@ -991,10 +1176,10 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     gr.Examples(
         examples=[
-            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 10, 2.5, False, False, True, "cosine"],
-            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 10, 2.5, False, False, True, "cosine"]
+            ["A sea turtle swimming near a coral reef in the ocean, with a clear blue sky and water in the background.", 10, 2.5, 256, False, False, True, False, 1, "cosine"],
+            ["A beautiful sunset over a calm ocean, with a few clouds in the sky.", 10, 2.5, 256, False, False, True, False, 1, "cosine"]
         ],
-        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, free_cache_checkbox_t2i, abort_ram_checkbox_t2i, fp8_checkbox_t2i, scheduler_radio_t2i],
+        inputs=[prompt_input_box_t2i, steps_slider_t2i, guidance_scale_slider_t2i, num_vq_tokens_slider_t2i, free_cache_checkbox_t2i, abort_ram_checkbox_t2i, fp8_checkbox_t2i, debug_checkbox_t2i, trim_vram_slider_t2i, scheduler_radio_t2i],
         outputs=[output_image_t2i, output_status_t2i],
         fn=generate_viz_wrapper_t2i,
     )
@@ -1005,9 +1190,12 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             prompt_input_box_t2i,
             steps_slider_t2i,
             guidance_scale_slider_t2i,
+            num_vq_tokens_slider_t2i,
             free_cache_checkbox_t2i,
             abort_ram_checkbox_t2i,
             fp8_checkbox_t2i,
+            debug_checkbox_t2i,
+            trim_vram_slider_t2i,
             scheduler_radio_t2i
         ],
         outputs=[output_image_t2i, output_status_t2i]
@@ -1022,14 +1210,14 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
 
     think_button_lm.click(
         fn=toggle_thinking_mode_lm,
-        inputs=[thinking_mode_lm],
-        outputs=[thinking_mode_lm, think_button_lm]
+        inputs=[thinking_mode_checkbox_lm],
+        outputs=[thinking_mode_checkbox_lm, think_button_lm]
     )
 
     think_button_mmu.click(
         fn=toggle_thinking_mode_mmu,
-        inputs=[thinking_mode_mmu],
-        outputs=[thinking_mode_mmu, think_button_mmu]
+        inputs=[thinking_mode_checkbox_mmu],
+        outputs=[thinking_mode_checkbox_mmu, think_button_mmu]
     )
             
 
@@ -1072,10 +1260,12 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             temperature_slider_lm,
             cfg_scale_slider_lm,
             remasking_dropdown_lm,
-            thinking_mode_lm,
+            thinking_mode_checkbox_lm,
             free_cache_checkbox_lm,
             abort_ram_checkbox_lm,
-            fp8_checkbox_lm
+            fp8_checkbox_lm,
+            debug_checkbox_lm,
+            trim_vram_slider_lm
         ],
         outputs=[output_visualization_box_lm, output_final_text_box_lm]
     )
@@ -1091,10 +1281,12 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
             temperature_slider_mmu,
             cfg_scale_slider_mmu,
             remasking_dropdown_mmu,
-            thinking_mode_mmu,
+            thinking_mode_checkbox_mmu,
             free_cache_checkbox_mmu,
             abort_ram_checkbox_mmu,
-            fp8_checkbox_mmu
+            fp8_checkbox_mmu,
+            debug_checkbox_mmu,
+            trim_vram_slider_mmu
         ],
         outputs=[output_visualization_box_mmu, output_final_text_box_mmu]
     )
@@ -1152,7 +1344,7 @@ with gr.Blocks(css=css_styles, theme=theme) as demo:
     fast_mode_checkbox_t2i.change(
         fn=apply_fast_mode_t2i,
         inputs=[fast_mode_checkbox_t2i],
-        outputs=[steps_slider_t2i, guidance_scale_slider_t2i],
+        outputs=[steps_slider_t2i, guidance_scale_slider_t2i, num_vq_tokens_slider_t2i],
         queue=False
     )
 

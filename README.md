@@ -44,6 +44,17 @@
   </a>  
 </p>
 
+## Fork Notice (DGX Spark)
+This repository is a **fork** of the original MMaDA codebase, created to test and iterate on the model in the **DGX Spark** environment. Changes relative to upstream focus on practical evaluation and stability during interactive inference, including:
+- UI/UX adjustments for generation controls and faster presets.
+- Memory management safeguards (VRAM abort, cache trimming, explicit cache clearing).
+- Optional FP8 execution path for Blackwell-class GPUs (via Transformer Engine) with bf16 confidence path.
+- T2I resolution control via `num_vq_tokens` and fast-mode defaults tuned for lower VRAM use.
+- Debug logging for VRAM and logits shapes during sampling (toggle in UI).
+- Project-level dependency and index settings aligned with DGX Spark.
+
+If you are looking for the original implementation, please refer to the upstream Gen-Verse/MMaDA repository.
+
 
 ## 🌌 Introduction
 MMaDA is a new family of **multimodal diffusion foundation models** designed to achieve superior performance across diverse domains such as textual reasoning, multimodal understanding, and text-to-image generation. MMaDA is distinguished by three key innovations:
@@ -209,7 +220,5 @@ Please refer to [evaluation/eval.md](evaluation/eval.md) for more details.
 
 ## 🤝 Acknowledgments
 This work is heavily based on [Show-o](https://github.com/showlab/Show-o), [LLaDA](https://github.com/ML-GSAI/LLaDA), [maskgit](https://github.com/google-research/maskgit), [transformers](https://github.com/huggingface/transformers), [accelerate](https://github.com/huggingface/accelerate) and [webdataset](https://github.com/webdataset/webdataset). Thanks to all the authors for their great work.
-
-
 
 
